@@ -34,6 +34,15 @@ DEFAULT_DC_ID = 4
 DEFAULT_IPV4_IP = '149.154.167.51'
 DEFAULT_IPV6_IP = '[2001:67c:4e8:f002::a]'
 DEFAULT_PORT = 443
+DEFAULT_IPV6_PORT = 80
+
+BUILD_IN_IPV6_DCS = [
+    { "id": 1, "ip_address": "2001:b28:f23d:f001::a", "port": 80 },
+    { "id": 2, "ip_address": "2001:67c:4e8:f002::a", "port": 80 },
+    { "id": 3, "ip_address": "2001:b28:f23d:f003::a", "port": 80 },
+    { "id": 4, "ip_address": "2001:67c:4e8:f004::a", "port": 80 },
+    { "id": 5, "ip_address": "2001:b28:f23f:f005::a", "port": 80 }
+]
 
 __log__ = logging.getLogger(__name__)
 
@@ -101,7 +110,7 @@ class TelegramBareClient:
             session.set_dc(
                 DEFAULT_DC_ID,
                 DEFAULT_IPV6_IP if self._use_ipv6 else DEFAULT_IPV4_IP,
-                DEFAULT_PORT
+                DEFAULT_IPV6_PORT if self._use_ipv6 else DEFAULT_PORT
             )
 
         session.report_errors = report_errors
@@ -113,6 +122,7 @@ class TelegramBareClient:
         # that calls .connect(). Every other thread will spawn a new
         # temporary connection. The connection on this one is always
         # kept open so Telegram can send us updates.
+        self.connection_mode = connection_mode
         self._sender = MtProtoSender(self.session, Connection(
             mode=connection_mode, proxy=proxy, timeout=timeout
         ))
@@ -195,6 +205,9 @@ class TelegramBareClient:
            native data center, raising a "UserMigrateError", and
            calling .disconnect() in the process.
         """
+        if self.connection_mode == ConnectionMode.HTTP:
+            _sync_updates = False
+
         __log__.info('Connecting to %s:%d...',
                      self.session.server_address, self.session.port)
 
@@ -267,7 +280,7 @@ class TelegramBareClient:
         self._first_request = True  # On reconnect it will be first again
         self.session.close()
 
-    def _reconnect(self, new_dc=None):
+    def _reconnect(self, new_dc=None, from_default=None):
         """If 'new_dc' is not set, only a call to .connect() will be made
            since it's assumed that the connection has been lost and the
            library is reconnecting.
@@ -291,10 +304,15 @@ class TelegramBareClient:
             # Since we're reconnecting possibly due to a UserMigrateError,
             # we need to first know the Data Centers we can connect to. Do
             # that before disconnecting.
-            dc = self._get_dc(new_dc)
-            __log__.info('Reconnecting to new data center %s', dc)
+            if from_default:
+                dc = self._get_default_dc(new_dc)
+                __log__.info('Reconnecting to new data center %s', dc)
+                self.session.set_dc(dc['id'], dc['ip_address'], dc['port'])
+            else:
+                dc = self._get_dc(new_dc)
+                __log__.info('Reconnecting to new data center %s', dc)
+                self.session.set_dc(dc.id, dc.ip_address, dc.port)
 
-            self.session.set_dc(dc.id, dc.ip_address, dc.port)
             # auth_key's are associated with a server, which has now changed
             # so it's not valid anymore. Set to None to force recreating it.
             self.session.auth_key = None
@@ -339,6 +357,9 @@ class TelegramBareClient:
             # New configuration, perhaps a new CDN was added?
             TelegramBareClient._config = self(GetConfigRequest())
             return self._get_dc(dc_id, cdn=cdn)
+
+    def _get_default_dc(self, dc_id):
+        return BUILD_IN_IPV6_DCS[dc_id - 1]
 
     def _get_exported_client(self, dc_id):
         """Creates and connects a new TelegramBareClient for the desired DC.
@@ -424,6 +445,7 @@ class TelegramBareClient:
            The invoke will be retried up to 'retries' times before raising
            RuntimeError().
         """
+
         if not all(isinstance(x, TLObject) and
                    x.content_related for x in requests):
             raise TypeError('You can only invoke requests, not types!')
@@ -462,6 +484,11 @@ class TelegramBareClient:
             if not self._reconnect_lock.locked():
                 with self._reconnect_lock:
                     self._reconnect()
+            if self.connection_mode == ConnectionMode.HTTP:
+                self.remembered_requests = requests[0]
+                self._invoke(call_receive, *(GetStateRequest(),))
+                self._process_rpc_errors(call_receive, *(self.remembered_requests,))
+                return self.remembered_requests.result
 
         raise RuntimeError('Number of retries reached 0 for {}.'.format(
             [type(x).__name__ for x in requests]
@@ -508,7 +535,17 @@ class TelegramBareClient:
                     )
             else:
                 while not all(x.confirm_received.is_set() for x in requests):
-                    self._sender.receive(update_state=self.updates)
+                    try:
+                        self._sender.receive(update_state=self.updates)
+                    except (PhoneMigrateError, NetworkMigrateError,
+                            UserMigrateError) as e:
+
+                        # TODO What happens with the background thread here?
+                        # For normal use cases, this won't happen, because this will only
+                        # be on the very first connection (not authorized, not running),
+                        # but may be an issue for people who actually travel?
+                        self._reconnect(new_dc=e.new_dc, from_default=True)
+                        return self._invoke(call_receive, *requests)
 
         except BrokenAuthKeyError:
             __log__.error('Authorization key seems broken and was invalid!')
@@ -537,9 +574,15 @@ class TelegramBareClient:
 
         # Clear the flag if we got this far
         self._first_request = False
+        return self._process_rpc_errors(self, requests)
 
+    def _process_rpc_errors(self, call_receive, *requests):
         try:
-            raise next(x.rpc_error for x in requests if x.rpc_error)
+            for x in requests:
+                if isinstance(x, (list, tuple)):
+                    x = x[0]
+                if x.rpc_error:
+                    raise next(x.rpc_error)
         except StopIteration:
             if any(x.result is None for x in requests):
                 # "A container may only be accepted or

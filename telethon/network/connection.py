@@ -39,6 +39,7 @@ class ConnectionMode(Enum):
     TCP_INTERMEDIATE = 2
     TCP_ABRIDGED = 3
     TCP_OBFUSCATED = 4
+    HTTP = 5
 
 
 class Connection:
@@ -65,6 +66,9 @@ class Connection:
         self._aes_encrypt, self._aes_decrypt = None, None
 
         # TODO Rename "TcpClient" as some sort of generic socket?
+        #if mode == ConnectionMode.HTTP:
+        #    self.conn = HttpClient(proxy=proxy, timeout=timeout)
+        #else:
         self.conn = TcpClient(proxy=proxy, timeout=timeout)
 
         # Sending messages
@@ -80,11 +84,17 @@ class Connection:
                       ConnectionMode.TCP_OBFUSCATED):
             setattr(self, 'send', self._send_abridged)
             setattr(self, 'recv', self._recv_abridged)
+        elif mode == ConnectionMode.HTTP:
+            setattr(self, 'send', self._send_http)
+            setattr(self, 'recv', self._recv_http)
 
         # Writing and reading from the socket
         if mode == ConnectionMode.TCP_OBFUSCATED:
             setattr(self, 'write', self._write_obfuscated)
             setattr(self, 'read', self._read_obfuscated)
+        elif mode == ConnectionMode.HTTP:
+            setattr(self, 'write', self._write_plain)
+            setattr(self, 'read', self._read_plain_http)
         else:
             setattr(self, 'write', self._write_plain)
             setattr(self, 'read', self._read_plain)
@@ -230,6 +240,52 @@ class Connection:
 
         return self.read(length << 2)
 
+    def _recv_http(self, **kwargs):
+        headers = []
+        length = 0
+        close = False
+        dummy_response = ''
+        while True:
+            current_header = [b'']
+            while current_header[-1] != '\n':
+                try:
+                    readed_byte = self.read(1)
+                    current_header.append(readed_byte)
+                except TimeoutError:
+                    if not len(current_header) == 1:
+                        # indication of dummy response
+                        dummy_response = b''.join(current_header).strip()
+                        break
+                    else:
+                        raise TimeoutError()
+            try:
+                current_header = ''.join(current_header).strip()
+            except TypeError:
+                # dummy response
+                break
+            if not current_header:
+                break
+
+            if current_header.startswith('Content-Length: '):
+                length = int(current_header[16:])
+
+            elif current_header.startswith('Connection: close'):
+                close = True
+
+            headers.append(current_header)
+
+        if not length:
+            return dummy_response
+        data = self.read(length)
+        if headers[0] != 'HTTP/1.1 200 OK':
+            print('RPC ERROR: ', headers[0])
+
+        if close:
+            # Reopen connectino
+            raise ValueError('Not Implemented')
+
+        return data
+
     # endregion
 
     # region Send message implementations
@@ -278,6 +334,8 @@ class Connection:
 
         self.write(length + message)
 
+    def _send_http(self, message):
+        self.write(message)
     # endregion
 
     # region Read implementations
@@ -293,6 +351,16 @@ class Connection:
         :return: a byte sequence with len(data) == length
         """
         return self.conn.read(length)
+
+    def _read_plain_http(self, length):
+        """
+        Reads data from the socket connection.
+
+        :param length: how many bytes should be read.
+        :param uknown_size: indication that we dont know exect length of the packet.
+        :return: a byte sequence with len(data) == length
+        """
+        return self.conn.read(length, unknown_size=True)
 
     def _read_obfuscated(self, length):
         """

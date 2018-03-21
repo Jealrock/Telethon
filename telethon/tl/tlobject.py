@@ -143,7 +143,6 @@ class TLObject:
     # These are nearly always the same for all subclasses
     def on_response(self, reader):
         self.result = reader.tgread_object()
-        print(self.result)
 
     def __eq__(self, o):
         return isinstance(o, type(self)) and self.to_dict() == o.to_dict()

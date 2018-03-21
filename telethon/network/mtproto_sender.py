@@ -87,6 +87,7 @@ class MtProtoSender:
         # Finally send our packed request(s)
         messages = [TLMessage(self.session, r) for r in requests]
         self._pending_receive.update({m.msg_id: m for m in messages})
+        self.last_messages_id = [m.msg_id for m in messages]
 
         __log__.debug('Sending requests with IDs: %s', ', '.join(
             '{}: {}'.format(m.request.__class__.__name__, m.msg_id)
@@ -216,7 +217,6 @@ class MtProtoSender:
             return False
 
         obj = reader.tgread_object()
-        print(obj)
         __log__.debug('Processing %s result', type(obj).__name__)
 
         if isinstance(obj, Pong):
@@ -350,7 +350,6 @@ class MtProtoSender:
         return True
 
     def _handle_http_wait(self, msg_id, sequence, http_wait):
-        print("recieved handle http wait")
         return
 
     def _handle_container(self, msg_id, sequence, reader, state):
@@ -503,6 +502,7 @@ class MtProtoSender:
             if request:
                 request.rpc_error = error
                 request.confirm_received.set()
+                self.last_request = request
 
             __log__.debug('Confirmed %s through error %s',
                           type(request).__name__, error)
@@ -522,6 +522,7 @@ class MtProtoSender:
                 reader.seek(-4)
                 request.on_response(reader)
 
+            self.last_request = request
             self.session.process_entities(request.result)
             request.confirm_received.set()
             __log__.debug(
@@ -561,5 +562,12 @@ class MtProtoSender:
             # that we are already aware of, see 1a91c02 and old 63dfb1e)
             self._need_confirmation -= {msg_id}
             return self._process_msg(msg_id, sequence, compressed_reader, state)
+
+    # endregion
+
+    # region helpers
+
+    def get_last_request(self):
+        return self.last_request
 
     # endregion

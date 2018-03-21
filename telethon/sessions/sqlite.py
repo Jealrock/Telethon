@@ -260,6 +260,7 @@ class SQLiteSession(MemorySession):
         if not rows:
             return
 
+        print(rows)
         with self._db_lock:
             self._cursor().executemany(
                 'insert or replace into entities values (?,?,?,?,?)', rows

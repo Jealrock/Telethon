@@ -485,10 +485,8 @@ class TelegramBareClient:
                 with self._reconnect_lock:
                     self._reconnect()
             if self.connection_mode == ConnectionMode.HTTP:
-                self.remembered_requests = requests[0]
                 self._invoke(call_receive, *(GetStateRequest(),))
-                self._process_rpc_errors(call_receive, *(self.remembered_requests,))
-                return self.remembered_requests.result
+                return self._process_rpc_errors(call_receive, *(self._sender.get_last_request(),))
 
         raise RuntimeError('Number of retries reached 0 for {}.'.format(
             [type(x).__name__ for x in requests]
@@ -574,15 +572,11 @@ class TelegramBareClient:
 
         # Clear the flag if we got this far
         self._first_request = False
-        return self._process_rpc_errors(self, requests)
+        return self._process_rpc_errors(self, *requests)
 
     def _process_rpc_errors(self, call_receive, *requests):
         try:
-            for x in requests:
-                if isinstance(x, (list, tuple)):
-                    x = x[0]
-                if x.rpc_error:
-                    raise next(x.rpc_error)
+            raise next(x.rpc_error for x in requests if x.rpc_error)
         except StopIteration:
             if any(x.result is None for x in requests):
                 # "A container may only be accepted or
